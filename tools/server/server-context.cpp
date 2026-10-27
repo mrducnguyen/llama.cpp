@@ -500,6 +500,40 @@ struct server_slot {
             n_draft_max = std::min(n_draft_max, n_remaining() - 1);
         }
 
+        // Depth-adaptive speculation.
+        //
+        // Self-speculation (MTP/nextn) acceptance decays as the context fills,
+        // but every rejected draft still costs a full verify pass, so a setting
+        // that is a large win on an empty context becomes a large loss deep in
+        // one. Measured on Qwen3.6-35B-A3B (R9700, 2026-07-21):
+        //
+        //   depth 0     1.25x        depth 32K   1.02x
+        //   depth 64K   1.01x        depth 104K  0.68x  (76.15 -> 51.80 t/s)
+        //
+        // Prefill degrades too (-38% at 104K). A single static --spec-draft-n-max
+        // therefore cannot be right for a server spanning 4K..256K contexts, so
+        // taper it with the live context depth and switch off once it stops
+        // paying for itself.
+        //
+        // Tunable; LLAMA_SPEC_DEPTH_HI=0 disables this entirely and restores the
+        // stock always-on behaviour, so the feature is opt-out without a rebuild.
+        {
+            static const int d_lo  = std::getenv("LLAMA_SPEC_DEPTH_LO")
+                                   ? std::atoi(std::getenv("LLAMA_SPEC_DEPTH_LO")) : 8192;
+            static const int d_hi  = std::getenv("LLAMA_SPEC_DEPTH_HI")
+                                   ? std::atoi(std::getenv("LLAMA_SPEC_DEPTH_HI")) : 49152;
+            static const int n_mid = std::getenv("LLAMA_SPEC_N_MID")
+                                   ? std::atoi(std::getenv("LLAMA_SPEC_N_MID")) : 2;
+
+            const int n_depth = prompt.n_tokens();
+
+            if (d_hi > 0 && n_depth >= d_hi) {
+                n_draft_max = 0;
+            } else if (d_lo > 0 && n_depth >= d_lo) {
+                n_draft_max = std::min(n_draft_max, n_mid);
+            }
+        }
+
         SLT_DBG(*this, "max possible draft: %d\n", n_draft_max);
 
         return n_draft_max;
