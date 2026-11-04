@@ -1,0 +1,84 @@
+{
+  "$schema": "https://raw.githubusercontent.com/omarchy/omarchy/main/schemas/plugin.json",
+  "schemaVersion": 1,
+  "id": "io.github.ducn.llama-router",
+  "name": "llama Router",
+  "version": "1.2.0",
+  "author": "ducn",
+  "license": "GPL-3.0-or-later",
+  "description": "Status for a llama.cpp router server: how many models are up, which GPU each one sits on, the port answering for it and the speed it last served, with start/stop/restart of the systemd user unit behind it.",
+  "repository": "https://github.com/mrducnguyen/llama.cpp",
+  "kinds": [
+    "bar-widget"
+  ],
+  "entryPoints": {
+    "barWidget": "Widget.qml"
+  },
+  "barWidget": {
+    "displayName": "llama Router",
+    "description": "Shows how many models a llama.cpp router keeps loaded, the card each one sits on, the port serving it and the token/s it last served for prompt processing and generation. Start / Stop / Restart drive a systemd user unit.",
+    "category": "System",
+    "allowMultiple": false,
+    "defaultSection": "right",
+    "defaults": {
+      "baseUrl": "http://127.0.0.1:14100",
+      "pollIntervalSec": 10,
+      "barMode": "count",
+      "barIcon": "\ue907",
+      "showIdle": false,
+      "serviceUnit": "llama-router.service"
+    },
+    "schema": [
+      {
+        "key": "baseUrl",
+        "type": "string",
+        "label": "Router URL",
+        "defaultValue": "http://127.0.0.1:14100",
+        "description": "Base URL of the llama.cpp router server (the one started with --models-preset). Only /models and /props are read."
+      },
+      {
+        "key": "serviceUnit",
+        "type": "string",
+        "label": "Systemd user unit",
+        "defaultValue": "llama-router.service",
+        "description": "User unit that runs start_server.sh. Start / Stop / Restart call systemctl --user on it."
+      },
+      {
+        "key": "pollIntervalSec",
+        "type": "integer",
+        "min": 3,
+        "max": 120,
+        "label": "Refresh interval",
+        "defaultValue": 10,
+        "description": "Seconds between status polls."
+      },
+      {
+        "key": "barMode",
+        "type": "enum",
+        "label": "Bar readout",
+        "options": [
+          "device",
+          "count",
+          "name",
+          "off"
+        ],
+        "defaultValue": "count",
+        "description": "count is the number of loaded models, device lists one short tag per card holding a model (CUDA0 -> c0), name spells out the loaded models, off keeps only the icon. Right-clicking the widget cycles these."
+      },
+      {
+        "key": "barIcon",
+        "type": "string",
+        "label": "Bar icon",
+        "defaultValue": "\ue907",
+        "description": "Icon glyph for the widget. U+E900..U+E90F are drawn with the omarchy brand font (default U+E907, the ollama llama); any other codepoint is a Nerd Font glyph in the bar font."
+      },
+      {
+        "key": "showIdle",
+        "type": "boolean",
+        "label": "List idle models too",
+        "defaultValue": false,
+        "description": "Add a section to the popup for models the router knows about but has not loaded."
+      }
+    ]
+  }
+}
