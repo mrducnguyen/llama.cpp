@@ -70,6 +70,21 @@ struct server_subproc {
     }
 };
 
+// device a model instance is pinned to, read from its rendered args ('' when unpinned)
+static std::string model_pinned_device(const server_model_meta & meta) {
+    for (size_t i = 0; i + 1 < meta.args.size(); i++) {
+        if (meta.args[i] == "--device") {
+            return meta.args[i + 1];
+        }
+    }
+    return "";
+}
+
+static bool model_on_device(const server_model_meta & meta, const std::string & dev) {
+    const std::string have = model_pinned_device(meta);
+    return have.empty() || have == dev; // unpinned: the router cannot tell, assume it may be there
+}
+
 struct server_lru_sched {
     server_lru_sched(server_models & models) : models(models) {}
 
@@ -82,6 +97,15 @@ struct server_lru_sched {
     // returns "" if no model can be given up
     std::string pick_victim(std::unique_lock<std::mutex> & lk, const std::string & exclude) {
         check_lock(lk);
+        // the card the requester will load into, empty when it is not pinned
+        std::string want;
+        auto req = models.mapping.find(exclude);
+        if (req != models.mapping.end()) {
+            want = model_pinned_device(req->second.meta);
+        }
+        // if that card already holds a model, only a victim from it frees usable VRAM
+        bool same_card_only = !want.empty() && card_taken(lk, exclude, want);
+
         std::string victim;
         int64_t victim_last_used = 0;
         for (const auto & m : models.mapping) {
@@ -91,6 +115,9 @@ struct server_lru_sched {
             // a busy model is mid-request, one still coming up has no request to finish
             if (m.second.req_count != 0 || !m.second.meta.is_ready_or_sleep()) {
                 continue;
+            }
+            if (same_card_only && !model_on_device(m.second.meta, want)) {
+                continue; // a model on another card is not the blocker, giving it up is wasted
             }
             if (victim.empty() || m.second.meta.last_used < victim_last_used) {
                 victim           = m.first;
@@ -203,11 +230,27 @@ struct server_lru_sched {
             if (it == models.mapping.end() || it->second.req_count != 0 || !it->second.meta.is_ready_or_sleep()) {
                 return;
             }
+            // hand the slot to a request that can actually use this card
+            const std::string have = model_pinned_device(it->second.meta);
+            bool handed_off = false;
             for (auto & e : queue) {
-                if (!e.slot_pending) {
-                    e.slot_pending = true;
-                    break;
+                if (!e.needs_slot()) {
+                    continue;
                 }
+                auto req = models.mapping.find(e.model_id);
+                if (req == models.mapping.end()) {
+                    continue;
+                }
+                const std::string want = model_pinned_device(req->second.meta);
+                if (!want.empty() && !have.empty() && have != want && card_taken(lk, e.model_id, want)) {
+                    continue; // that request is blocked by a model on another card, not by this one
+                }
+                e.slot_pending = true;
+                handed_off     = true;
+                break;
+            }
+            if (!handed_off) {
+                return; // no queued request can use this card, keep the model loaded
             }
         }
         SRV_INF("model name=%s went idle, giving up its slot to a queued request\n", model_id.c_str());
@@ -215,6 +258,20 @@ struct server_lru_sched {
     }
 
   private:
+    // true if a running model other than requester already sits on that card
+    bool card_taken(std::unique_lock<std::mutex> & lk, const std::string & requester, const std::string & dev) {
+        check_lock(lk);
+        for (const auto & m : models.mapping) {
+            if (m.first == requester) {
+                continue;
+            }
+            if (m.second.meta.is_running() && model_on_device(m.second.meta, dev)) {
+                return true;
+            }
+        }
+        return false;
+    }
+
     struct entry_t {
         std::string model_id;
         int  n_waiters;    // requests waiting for this model
@@ -935,21 +992,21 @@ std::vector<server_model_meta> server_models::get_all_meta() {
     return result;
 }
 
-void server_models::unload_lru() {
+void server_models::unload_lru(const std::string & for_name) {
     if (base_params.models_max <= 0) {
         return; // no limit
     }
-    // remove one of the servers if we passed the models_max (least recently used - LRU)
+    // give up one slot to make room for for_name, preferring a model on its card
     std::string lru_model_name;
     {
         std::unique_lock<std::mutex> lk(mutex);
         if (sched->has_capacity(lk)) {
             return;
         }
-        lru_model_name = sched->pick_victim(lk, "");
+        lru_model_name = sched->pick_victim(lk, for_name);
     }
     if (!lru_model_name.empty()) {
-        SRV_INF("models_max limit reached, removing LRU name=%s\n", lru_model_name.c_str());
+        SRV_INF("models_max limit reached, giving up name=%s for name=%s\n", lru_model_name.c_str(), for_name.c_str());
         unload(lru_model_name);
         // wait for unload to complete
         {
@@ -975,7 +1032,7 @@ void server_models::load(const std::string & name, const load_options & opts) {
         if (!has_model(name)) {
             throw std::runtime_error("model name=" + name + " is not found");
         }
-        unload_lru();
+        unload_lru(name);
     }
 
     std::unique_lock<std::mutex> lk(mutex);

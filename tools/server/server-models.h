@@ -210,8 +210,8 @@ private:
 
     void update_meta(const std::string & name, const server_model_meta & meta);
 
-    // unload least recently used models if the limit is reached
-    void unload_lru();
+    // unload one model to make room for for_name, preferring one on its card
+    void unload_lru(const std::string & for_name);
 
     // not thread-safe, caller must hold mutex
     void add_model(server_model_meta && meta);
