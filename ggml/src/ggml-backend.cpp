@@ -779,6 +779,13 @@ static bool ggml_is_view_op(enum ggml_op op) {
 #define GGML_SCHED_MAX_PREFETCH_SLOTS 8
 #endif
 
+// MMQ reads past the end of the last quant block, up to roughly one k-tile of block bytes.
+// The regular expert copy path is saved by landing in the shared copy pool, so the prefetch
+// slots need explicit slack.
+#ifndef GGML_SCHED_PREFETCH_TAIL_SLACK
+#define GGML_SCHED_PREFETCH_TAIL_SLACK 2048
+#endif
+
 struct ggml_backend_sched_split {
     int backend_id;
     int i_start;
@@ -1780,6 +1787,27 @@ static size_t ggml_backend_sched_prefetch_max_size(ggml_backend_sched_t sched) {
     return max_size;
 }
 
+static void ggml_backend_sched_prefetch_zero(ggml_backend_buffer_t buffer, size_t offset, size_t len) {
+    static const uint8_t zeros[GGML_SCHED_PREFETCH_TAIL_SLACK] = {0};
+
+    const struct ggml_init_params params = {
+        /* .mem_size =   */ 1024,
+        /* .mem_buffer = */ NULL,
+        /* .no_alloc =   */ true
+    };
+
+    ggml_context * ctx = ggml_init(params);
+    if (ctx == NULL) {
+        return;
+    }
+
+    ggml_tensor * t = ggml_new_tensor_1d(ctx, GGML_TYPE_I8, (int64_t) len);
+    ggml_backend_tensor_alloc(buffer, t, (char *) ggml_backend_buffer_get_base(buffer) + offset);
+    ggml_backend_tensor_set(t, zeros, 0, len);
+
+    ggml_free(ctx);
+}
+
 static bool ggml_backend_sched_prefetch_init(ggml_backend_sched_t sched, ggml_backend_t split_backend, size_t size) {
     if (sched->prefetch_backend == NULL) {
         ggml_backend_dev_t dev = split_backend->device;
@@ -1805,22 +1833,29 @@ static bool ggml_backend_sched_prefetch_init(ggml_backend_sched_t sched, ggml_ba
     }
 
     size = std::max(size, ggml_backend_sched_prefetch_max_size(sched));
+    const size_t slot_size = size + GGML_SCHED_PREFETCH_TAIL_SLACK;
 
     ggml_backend_buffer_type_t buft = ggml_backend_get_default_buffer_type(split_backend);
     for (int i = 0; i < sched->prefetch_n_slots; i++) {
-        if (sched->prefetch_slots[i] == NULL || ggml_backend_buffer_get_size(sched->prefetch_slots[i]) < size) {
+        if (sched->prefetch_slots[i] == NULL || ggml_backend_buffer_get_size(sched->prefetch_slots[i]) < slot_size) {
             // allocate before freeing so a failure leaves the old slot intact
-            ggml_backend_buffer_t new_buf = ggml_backend_buft_alloc_buffer(buft, size);
+            ggml_backend_buffer_t new_buf = ggml_backend_buft_alloc_buffer(buft, slot_size);
             if (new_buf == NULL) {
                 // overlap needs at least 2 slots, otherwise run with what fits
                 if (i >= 2 && sched->prefetch_slots[0] != NULL &&
-                    ggml_backend_buffer_get_size(sched->prefetch_slots[0]) >= size) {
+                    ggml_backend_buffer_get_size(sched->prefetch_slots[0]) >= slot_size) {
                     sched->prefetch_n_slots = i;
                     sched->prefetch_cur = 0;
                     return true;
                 }
                 ggml_backend_sched_prefetch_disable(sched, split_backend);
                 return false;
+            }
+            // zero the slack so a read past the weights sees zeros instead of stale bytes
+            const size_t buf_size = ggml_backend_buffer_get_size(new_buf);
+            if (buf_size > size) {
+                ggml_backend_sched_prefetch_zero(new_buf, size,
+                                                 std::min<size_t>(GGML_SCHED_PREFETCH_TAIL_SLACK, buf_size - size));
             }
             if (sched->prefetch_slots[i] != NULL) {
                 ggml_backend_synchronize(split_backend);
