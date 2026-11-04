@@ -711,12 +711,16 @@ void process_shaders() {
             // pre-attention and inverse WHT to output post-attention).
             for (std::string turbo : {"turbo2_0", "turbo3_0", "turbo4_0"}) {
                 const std::string data_a = "DATA_A_" + to_uppercase(turbo);
+                // Drop the inherited DATA_A_IQ4_NL: these variants bind turbo K/V only,
+                // and two DATA_A_* defines would collide on QUANT_K/A_TYPE in types.glsl.
+                std::map<std::string, std::string> fa_turbo_dict = fa_base_dict;
+                fa_turbo_dict.erase("DATA_A_IQ4_NL");
                 string_to_spv("flash_attn_f32_f16_" + turbo, "flash_attn.comp",
-                    merge_maps(fa_base_dict, {{data_a, "1"}, {"Q_TYPE", "float"}, {"D_TYPE", "float"}, {"D_TYPEV4", "vec4"}}), fp16, false, false, f16acc);
+                    merge_maps(fa_turbo_dict, {{data_a, "1"}, {"Q_TYPE", "float"}, {"D_TYPE", "float"}, {"D_TYPEV4", "vec4"}}), fp16, false, false, f16acc);
 #if defined(GGML_VULKAN_COOPMAT_GLSLC_SUPPORT)
                 if (fp16) {
                     string_to_spv("flash_attn_f32_f16_" + turbo, "flash_attn_cm1.comp",
-                        merge_maps(fa_base_dict, {{data_a, "1"}, {"Q_TYPE", "float"}, {"D_TYPE", "float"}, {"D_TYPEV4", "vec4"}, {"COOPMAT", "1"}}), fp16, true, false, f16acc);
+                        merge_maps(fa_turbo_dict, {{data_a, "1"}, {"Q_TYPE", "float"}, {"D_TYPE", "float"}, {"D_TYPEV4", "vec4"}, {"COOPMAT", "1"}}), fp16, true, false, f16acc);
                 }
 #endif
             }
