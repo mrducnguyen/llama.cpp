@@ -365,8 +365,16 @@ json server_chat_convert_anthropic_to_oai(const json & body) {
     }
     const json & messages = body.at("messages");
     if (messages.is_array()) {
-        for (const auto & msg : messages) {
+        for (json msg : messages) {
             std::string role = json_value(msg, "role", std::string());
+
+            // clients such as Claude Code may send system messages mid-conversation;
+            // many chat templates only accept a leading system message, so demote them to user
+            // (keeping their position also keeps the prompt prefix stable for the KV cache)
+            if (role == "system" && !oai_messages.empty()) {
+                role = "user";
+                msg["role"] = role;
+            }
 
             if (!msg.contains("content")) {
                 if (role == "assistant") {
