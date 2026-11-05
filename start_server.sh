@@ -92,6 +92,7 @@ sync_models_router() {
     while IFS= read -r -d '' f; do
         case "$(basename "$f")" in
             mmproj*) continue ;;   # vision projectors, not standalone models
+            mtp-*) continue ;;     # MTP draft heads, referenced via spec-draft-model
             *-of-*.gguf)
                 # split GGUF: only the first shard is a loadable entry point
                 [[ "$f" == *-00001-of-*.gguf ]] || continue
