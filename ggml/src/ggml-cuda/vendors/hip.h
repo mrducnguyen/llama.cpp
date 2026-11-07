@@ -29,6 +29,8 @@
 #define CU_MEM_LOCATION_TYPE_DEVICE hipMemLocationTypeDevice
 #define CU_MEM_ACCESS_FLAGS_PROT_READWRITE hipMemAccessFlagsProtReadWrite
 #define CU_CHECK(fn) {hipError_t err = fn; if(err != hipSuccess) { GGML_ABORT("HipVMM Failure: %s\n", hipGetErrorString(err)); }}
+#define CUDA_SUCCESS hipSuccess
+#define cu_get_error_str hipGetErrorString
 #define __shfl_sync(mask, var, laneMask, width) __shfl(var, laneMask, width)
 #define __shfl_up_sync(mask, var, laneMask, width) __shfl_up(var, laneMask, width)
 #define __shfl_xor_sync(mask, var, laneMask, width) __shfl_xor(var, laneMask, width)

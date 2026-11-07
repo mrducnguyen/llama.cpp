@@ -180,6 +180,15 @@ static int ggml_cuda_highest_compiled_arch(const int arch) {
 [[noreturn]]
 void ggml_cuda_error(const char * stmt, const char * func, const char * file, int line, const char * msg);
 
+// Thrown when an op cannot get the GPU memory it needs while a graph is being evaluated.
+// ggml_backend_cuda_graph_compute catches it and returns GGML_STATUS_ALLOC_FAILED, so running out
+// of VRAM fails the request instead of aborting the process. Only throw it from code that runs
+// inside graph evaluation, and before changing any state that the unwind would not restore.
+struct ggml_cuda_alloc_error {
+    const char * stmt;
+    const char * msg;
+};
+
 #define CUDA_CHECK_GEN(err, success, error_fn)                                      \
      do {                                                                           \
         auto err_ = (err);                                                          \
@@ -1509,17 +1518,31 @@ struct ggml_backend_cuda_context {
     cublasHandle_t cublas_handle() {
         if (cublas_handles[device][curr_stream_no] == nullptr) {
             ggml_cuda_set_device(device);
-            CUBLAS_CHECK(cublasCreate(&cublas_handles[device][curr_stream_no]));
-            CUBLAS_CHECK(cublasSetMathMode(cublas_handles[device][curr_stream_no], CUBLAS_TF32_TENSOR_OP_MATH));
-            CUBLAS_CHECK(cublasSetStream(cublas_handles[device][curr_stream_no], stream()));
+            // nothing is stored until every step has succeeded, so a later op can retry from scratch
+            cublasHandle_t handle = nullptr;
+            const cublasStatus_t status = cublasCreate(&handle);
+            if (status != CUBLAS_STATUS_SUCCESS) {
+                (void)cudaGetLastError();
+                throw ggml_cuda_alloc_error{"cublasCreate", cublas_get_error_str(status)};
+            }
+            CUBLAS_CHECK(cublasSetMathMode(handle, CUBLAS_TF32_TENSOR_OP_MATH));
+            CUBLAS_CHECK(cublasSetStream(handle, stream()));
 #if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA) && (CUBLAS_VER_MAJOR > 11 || (CUBLAS_VER_MAJOR == 11 && CUBLAS_VER_MINOR >= 2))
             if (cublas_workspace_sizes[device] == 0) {
                 const int cc = ggml_cuda_info().devices[device].cc;
                 cublas_workspace_sizes[device] = (cc >= GGML_CUDA_CC_HOPPER) ? 32 * 1024 * 1024 : 4 * 1024 * 1024;
             }
-            CUDA_CHECK(cudaMalloc(&cublas_workspaces[device][curr_stream_no], cublas_workspace_sizes[device]));
-            CUBLAS_CHECK(cublasSetWorkspace(cublas_handles[device][curr_stream_no], cublas_workspaces[device][curr_stream_no], cublas_workspace_sizes[device]));
+            void * workspace = nullptr;
+            const cudaError_t err = cudaMalloc(&workspace, cublas_workspace_sizes[device]);
+            if (err != cudaSuccess) {
+                (void)cudaGetLastError();
+                CUBLAS_CHECK(cublasDestroy(handle));
+                throw ggml_cuda_alloc_error{"cudaMalloc", cudaGetErrorString(err)};
+            }
+            CUBLAS_CHECK(cublasSetWorkspace(handle, workspace, cublas_workspace_sizes[device]));
+            cublas_workspaces[device][curr_stream_no] = workspace;
 #endif
+            cublas_handles[device][curr_stream_no] = handle;
         }
         return cublas_handles[device][curr_stream_no];
     }

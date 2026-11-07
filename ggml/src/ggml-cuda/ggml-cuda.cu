@@ -501,12 +501,21 @@ struct ggml_cuda_pool_leg : public ggml_cuda_pool {
             const size_t cached_bytes = pool_size;
             GGML_LOG_DEBUG(GGML_CUDA_NAME " pool[%d]: alloc of %.2f MiB failed, flushing %.2f MiB of cached buffers and retrying\n",
                            device, look_ahead_size/1024.0/1024.0, cached_bytes/1024.0/1024.0);
-            CUDA_CHECK(cudaDeviceSynchronize());
-            clear_pool();
-            err = ggml_cuda_device_malloc(&ptr, look_ahead_size, device);
-            if (err == cudaSuccess) {
-                GGML_LOG_DEBUG(GGML_CUDA_NAME " pool[%d]: retry succeeded\n", device);
+            // the cached buffers can only be flushed after a synchronize, which is not permitted while
+            // a CUDA graph is being captured. in that case keep them and report the allocation failure
+            if (cudaDeviceSynchronize() == cudaSuccess) {
+                clear_pool();
+                err = ggml_cuda_device_malloc(&ptr, look_ahead_size, device);
+                if (err == cudaSuccess) {
+                    GGML_LOG_DEBUG(GGML_CUDA_NAME " pool[%d]: retry succeeded\n", device);
+                }
+            } else {
+                (void)cudaGetLastError();
             }
+        }
+        if (err == cudaErrorMemoryAllocation) {
+            (void)cudaGetLastError();
+            throw ggml_cuda_alloc_error{"cudaMalloc", cudaGetErrorString(err)};
         }
         CUDA_CHECK(err);
         *actual_size = look_ahead_size;
@@ -589,7 +598,10 @@ struct ggml_cuda_pool_vmm : public ggml_cuda_pool {
             prop.location.type = CU_MEM_LOCATION_TYPE_DEVICE;
             prop.location.id = physical_device;
             CUmemGenericAllocationHandle handle;
-            CU_CHECK(cuMemCreate(&handle, reserve_size, &prop, 0));
+            const auto create_err = cuMemCreate(&handle, reserve_size, &prop, 0);
+            if (create_err != CUDA_SUCCESS) {
+                throw ggml_cuda_alloc_error{"cuMemCreate", cu_get_error_str(create_err)};
+            }
 
             // reserve virtual address space (if not already reserved)
             if (pool_addr == 0) {
@@ -4512,7 +4524,41 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
         CUDA_CHECK(cudaStreamBeginCapture(cuda_ctx->stream(), cudaStreamCaptureModeRelaxed));
     }
 
-    ggml_cuda_graph_evaluate_and_capture(cuda_ctx, cgraph, use_cuda_graph, cuda_graph_update_required, graph_key);
+    try {
+        ggml_cuda_graph_evaluate_and_capture(cuda_ctx, cgraph, use_cuda_graph, cuda_graph_update_required, graph_key);
+    } catch (const ggml_cuda_alloc_error & e) {
+        GGML_LOG_ERROR("%s: out of device memory on %s, failing the graph: %s: %s\n", __func__, cuda_ctx->name.c_str(), e.stmt, e.msg);
+
+        // the failure can happen while a concurrent region has its forked streams active
+        cuda_ctx->curr_stream_no = 0;
+
+#ifdef USE_CUDA_GRAPH
+        if (use_cuda_graph && cuda_graph_update_required) {
+            // discard the partial capture and run the warmup again, since the graph key and the
+            // node properties will match on the next call even though nothing usable was captured.
+            // the failed allocation can invalidate the capture, in which case ending it reports an
+            // error and returns no graph, which is fine since the result is thrown away anyway
+            cudaGraph_t partial = nullptr;
+            if (cudaStreamEndCapture(cuda_ctx->stream(), &partial) != cudaSuccess) {
+                (void)cudaGetLastError();
+            }
+            if (partial != nullptr) {
+                CUDA_CHECK(cudaGraphDestroy(partial));
+            }
+            cuda_ctx->cuda_graph(graph_key)->warmup_complete = false;
+
+            std::lock_guard<std::mutex> lock(ggml_cuda_lock);
+            if (ggml_cuda_lock_counter.fetch_sub(1, std::memory_order_relaxed) == 1) {
+                ggml_cuda_lock_cv.notify_all();
+            }
+        }
+#endif // USE_CUDA_GRAPH
+
+        // ops queued before the failure may still be using temporary buffers from the pool
+        CUDA_CHECK(cudaDeviceSynchronize());
+
+        return GGML_STATUS_ALLOC_FAILED;
+    }
 
     return GGML_STATUS_SUCCESS;
 }
