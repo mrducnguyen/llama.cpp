@@ -17,6 +17,7 @@ uint8_t * const alloc_base = (uint8_t *) 16;
 struct dummy_backend_context {
     size_t max_buffer_size = 64;
     size_t alignment       = 8;
+    bool   fail_alloc      = false; // simulate running out of device memory
 
     ggml_backend_buffer_i              buffer_interface;
     ggml_backend_device                device;
@@ -40,6 +41,9 @@ static const char * dummy_backend_buffer_type_get_name(ggml_backend_buffer_type_
 
 static ggml_backend_buffer_t dummy_backend_buffer_type_alloc_buffer(ggml_backend_buffer_type_t buft, size_t size) {
     dummy_backend_context * ctx    = (dummy_backend_context *) buft->context;
+    if (ctx->fail_alloc) {
+        return nullptr;
+    }
     ggml_backend_buffer_t & buffer = ctx->buffers.emplace_back();
     buffer                         = ggml_backend_buffer_init(buft, ctx->buffer_interface, ctx, size);
     return buffer;
@@ -650,6 +654,58 @@ static void test_graph_optimize_alloc_dep() {
     GGML_ASSERT(!graph_reuses_allocation(true));
 }
 
+// after a failed reservation the plan matches the graph but the buffers are missing:
+// allocating must report the failure instead of dereferencing them, and succeed once memory is available
+static void test_alloc_after_failed_reserve() {
+    dummy_backend backend = dummy_backend_init(SIZE_MAX);
+
+    auto [ctx, graph, ctx_ptr] = make_context();
+
+    ggml_tensor * x = make_input_with_size(ctx, 16);
+    ggml_tensor * y = ggml_scale(ctx, x, 2.0f);
+    ggml_set_output(y);
+    ggml_build_forward_expand(graph, y);
+
+    ggml_gallocr_ptr galloc = ggml_gallocr_ptr(ggml_gallocr_new(&backend.buffer_type));
+
+    backend.context->fail_alloc = true;
+    GGML_ASSERT(!ggml_gallocr_reserve(galloc.get(), graph));
+    GGML_ASSERT(!ggml_gallocr_alloc_graph(galloc.get(), graph));
+
+    backend.context->fail_alloc = false;
+    GGML_ASSERT(ggml_gallocr_alloc_graph(galloc.get(), graph));
+    check_all_allocated(graph);
+}
+
+// same through the scheduler with two backends, the way clip_encode() reaches the allocator
+static void test_sched_alloc_after_failed_reserve() {
+    dummy_backend backend_a = dummy_backend_init(SIZE_MAX);
+    dummy_backend backend_b = dummy_backend_init(SIZE_MAX);
+
+    auto [ctx, graph, ctx_ptr] = make_context();
+
+    ggml_tensor * x = make_input_with_size(ctx, 16);
+    ggml_tensor * y = ggml_scale(ctx, x, 2.0f);
+    ggml_set_output(y);
+    ggml_build_forward_expand(graph, y);
+
+    ggml_backend_t             backends[2] = { &backend_a.context->backend, &backend_b.context->backend };
+    ggml_backend_buffer_type_t bufts[2]    = { &backend_a.buffer_type, &backend_b.buffer_type };
+    ggml_backend_sched_ptr     sched(ggml_backend_sched_new(backends, bufts, 2, 8, false, true));
+
+    backend_a.context->fail_alloc = true;
+    backend_b.context->fail_alloc = true;
+    GGML_ASSERT(!ggml_backend_sched_reserve(sched.get(), graph));
+    ggml_backend_sched_reset(sched.get());
+    GGML_ASSERT(!ggml_backend_sched_alloc_graph(sched.get(), graph));
+
+    backend_a.context->fail_alloc = false;
+    backend_b.context->fail_alloc = false;
+    ggml_backend_sched_reset(sched.get());
+    GGML_ASSERT(ggml_backend_sched_alloc_graph(sched.get(), graph));
+    check_all_allocated(graph);
+}
+
 static void run(const char * name, void (*f)()) {
     printf("%s ", name);
     fflush(stdout);
@@ -672,5 +728,7 @@ int main() {
     run("test_buffer_size_zero", test_buffer_size_zero);
     run("test_reallocation", test_reallocation);
     run("test_graph_optimize_alloc_dep", test_graph_optimize_alloc_dep);
+    run("test_alloc_after_failed_reserve", test_alloc_after_failed_reserve);
+    run("test_sched_alloc_after_failed_reserve", test_sched_alloc_after_failed_reserve);
     return 0;
 }
