@@ -194,6 +194,13 @@ struct server_lru_sched {
         }
     }
 
+    // true if model_id is queued and no slot is coming for it yet
+    bool needs_slot(std::unique_lock<std::mutex> & lk, const std::string & model_id) {
+        check_lock(lk);
+        entry_t * e = find(model_id);
+        return e != nullptr && e->needs_slot();
+    }
+
     // model_id went idle: give up its slot if a queued request needs one
     // thread-safe, caller must NOT hold models.mutex
     void on_model_idle(const std::string & model_id) {
@@ -1531,6 +1538,19 @@ bool server_models::ensure_model_ready(const std::string & name, const std::func
                     queued = false; // entry is gone, the other waiters watch the status now
                 }
                 continue;
+            }
+
+            // a model that was still loading when we queued can be idle by now
+            if (queued && status == SERVER_MODEL_STATUS_UNLOADED && sched->needs_slot(lk, name) && !sched->has_capacity(lk)) {
+                const std::string late_victim = sched->pick_victim(lk, name);
+                if (!late_victim.empty()) {
+                    sched->mark_slot_pending(lk, name);
+                    lk.unlock();
+                    SRV_INF("evicting idle LRU name=%s to make room for queued name=%s\n", late_victim.c_str(), name.c_str());
+                    unload(late_victim);
+                    lk.lock();
+                    continue;
+                }
             }
 
             cv.wait_for(lk, std::chrono::milliseconds(200));
